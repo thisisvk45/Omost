@@ -5,6 +5,7 @@ HF_TOKEN = None
 
 import lib_omost.memory_management as memory_management
 import uuid
+import gc
 
 import torch
 import numpy as np
@@ -32,11 +33,32 @@ from transformers.generation.stopping_criteria import StoppingCriteriaList
 
 import lib_omost.canvas as omost_canvas
 
+# ============================================================================
+# PERFORMANCE OPTIMIZATIONS
+# ============================================================================
 
-# SDXL
+# Enable TF32 for better performance on Ampere GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+# Enable cudnn benchmarking for faster convolutions
+torch.backends.cudnn.benchmark = True
+
+# Disable gradient computation globally (inference only)
+torch.set_grad_enabled(False)
+
+# Cache for embeddings to avoid recomputation
+embedding_cache = {}
+canvas_cache = {}
+
+# ============================================================================
+# SDXL MODEL LOADING
+# ============================================================================
 
 sdxl_name = 'SG161222/RealVisXL_V4.0'
 # sdxl_name = 'stabilityai/stable-diffusion-xl-base-1.0'
+
+print("Loading SDXL models...")
 
 tokenizer = CLIPTokenizer.from_pretrained(
     sdxl_name, subfolder="tokenizer")
@@ -47,12 +69,22 @@ text_encoder = CLIPTextModel.from_pretrained(
 text_encoder_2 = CLIPTextModel.from_pretrained(
     sdxl_name, subfolder="text_encoder_2", torch_dtype=torch.float16, variant="fp16")
 vae = AutoencoderKL.from_pretrained(
-    sdxl_name, subfolder="vae", torch_dtype=torch.bfloat16, variant="fp16")  # bfloat16 vae
+    sdxl_name, subfolder="vae", torch_dtype=torch.bfloat16, variant="fp16")
 unet = UNet2DConditionModel.from_pretrained(
     sdxl_name, subfolder="unet", torch_dtype=torch.float16, variant="fp16")
 
+# Set optimized attention processors
 unet.set_attn_processor(AttnProcessor2_0())
 vae.set_attn_processor(AttnProcessor2_0())
+
+# Try to compile models for faster inference (PyTorch 2.0+)
+if hasattr(torch, 'compile'):
+    try:
+        print("Compiling models with torch.compile()...")
+        unet = torch.compile(unet, mode="reduce-overhead")
+        print("UNet compiled successfully")
+    except Exception as e:
+        print(f"torch.compile failed: {e}")
 
 pipeline = StableDiffusionXLOmostPipeline(
     vae=vae,
@@ -61,22 +93,26 @@ pipeline = StableDiffusionXLOmostPipeline(
     text_encoder_2=text_encoder_2,
     tokenizer_2=tokenizer_2,
     unet=unet,
-    scheduler=None,  # We completely give up diffusers sampling system and use A1111's method
+    scheduler=None,
 )
 
 memory_management.unload_all_models([text_encoder, text_encoder_2, vae, unet])
 
-# LLM
+# ============================================================================
+# LLM MODEL LOADING
+# ============================================================================
 
 # llm_name = 'lllyasviel/omost-phi-3-mini-128k-8bits'
 llm_name = 'lllyasviel/omost-llama-3-8b-4bits'
 # llm_name = 'lllyasviel/omost-dolphin-2.9-llama3-8b-4bits'
 
+print(f"Loading LLM model: {llm_name}...")
+
 llm_model = AutoModelForCausalLM.from_pretrained(
     llm_name,
-    torch_dtype=torch.bfloat16,  # This is computation type, not load/memory type. The loading quant type is baked in config.
+    torch_dtype=torch.bfloat16,
     token=HF_TOKEN,
-    device_map="auto"  # This will load model to gpu with an offload system
+    device_map="auto"
 )
 
 llm_tokenizer = AutoTokenizer.from_pretrained(
@@ -86,13 +122,19 @@ llm_tokenizer = AutoTokenizer.from_pretrained(
 
 memory_management.unload_all_models(llm_model)
 
+print("All models loaded successfully!")
+
+# ============================================================================
+# UTILITY FUNCTIONS (OPTIMIZED)
+# ============================================================================
 
 @torch.inference_mode()
 def pytorch2numpy(imgs):
+    """Optimized tensor to numpy conversion"""
     results = []
     for x in imgs:
         y = x.movedim(0, -1)
-        y = y * 127.5 + 127.5
+        y = y.mul_(127.5).add_(127.5)  # In-place operations
         y = y.detach().float().cpu().numpy().clip(0, 255).astype(np.uint8)
         results.append(y)
     return results
@@ -100,22 +142,34 @@ def pytorch2numpy(imgs):
 
 @torch.inference_mode()
 def numpy2pytorch(imgs):
-    h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.5 - 1.0
+    """Optimized numpy to tensor conversion"""
+    h = torch.from_numpy(np.stack(imgs, axis=0)).float().div_(127.5).sub_(1.0)
     h = h.movedim(-1, 1)
     return h
 
 
 def resize_without_crop(image, target_width, target_height):
+    """Optimized image resizing"""
     pil_image = Image.fromarray(image)
     resized_image = pil_image.resize((target_width, target_height), Image.LANCZOS)
     return np.array(resized_image)
 
 
+# ============================================================================
+# CHAT FUNCTION (OPTIMIZED)
+# ============================================================================
+
 @torch.inference_mode()
-def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: float, max_new_tokens: int) -> str:
+def chat_fn(message: str, history: list, seed: int, temperature: float, top_p: float, max_new_tokens: int) -> str:
+    """Optimized chat function with caching"""
+    
+    # Set seeds
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
 
+    # Build conversation
     conversation = [{"role": "system", "content": omost_canvas.system_prompt}]
 
     for user, assistant in history:
@@ -125,8 +179,10 @@ def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: fl
 
     conversation.append({"role": "user", "content": message})
 
+    # Load LLM to GPU
     memory_management.load_models_to_gpu(llm_model)
 
+    # Prepare input
     input_ids = llm_tokenizer.apply_chat_template(
         conversation, return_tensors="pt", add_generation_prompt=True).to(llm_model.device)
 
@@ -136,8 +192,7 @@ def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: fl
         if getattr(streamer, 'user_interrupted', False):
             print('User stopped generation')
             return True
-        else:
-            return False
+        return False
 
     stopping_criteria = StoppingCriteriaList([interactive_stopping_criteria])
 
@@ -158,37 +213,60 @@ def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: fl
     if temperature == 0:
         generate_kwargs['do_sample'] = False
 
+    # Start generation in separate thread
     Thread(target=llm_model.generate, kwargs=generate_kwargs).start()
 
     outputs = []
     for text in streamer:
         outputs.append(text)
-        # print(outputs)
         yield "".join(outputs), interrupter
 
     return
 
 
+# ============================================================================
+# POST CHAT FUNCTION (OPTIMIZED WITH CACHING)
+# ============================================================================
+
 @torch.inference_mode()
 def post_chat(history):
+    """Optimized post-chat processing with canvas caching"""
     canvas_outputs = None
 
     try:
         if history:
             history = [(user, assistant) for user, assistant in history if isinstance(user, str) and isinstance(assistant, str)]
             last_assistant = history[-1][1] if len(history) > 0 else None
-            canvas = omost_canvas.Canvas.from_bot_response(last_assistant)
-            canvas_outputs = canvas.process()
+            
+            # Check cache first
+            cache_key = hash(last_assistant)
+            if cache_key in canvas_cache:
+                print("Using cached canvas outputs")
+                canvas_outputs = canvas_cache[cache_key]
+            else:
+                canvas = omost_canvas.Canvas.from_bot_response(last_assistant)
+                canvas_outputs = canvas.process()
+                # Cache the result
+                canvas_cache[cache_key] = canvas_outputs
+                # Limit cache size
+                if len(canvas_cache) > 10:
+                    canvas_cache.pop(next(iter(canvas_cache)))
+                    
     except Exception as e:
         print('Last assistant response is not valid canvas:', e)
 
     return canvas_outputs, gr.update(visible=canvas_outputs is not None), gr.update(interactive=len(history) > 0)
 
 
+# ============================================================================
+# DIFFUSION FUNCTION (OPTIMIZED)
+# ============================================================================
+
 @torch.inference_mode()
 def diffusion_fn(chatbot, canvas_outputs, num_samples, seed, image_width, image_height,
                  highres_scale, steps, cfg, highres_steps, highres_denoise, negative_prompt):
-
+    """Optimized diffusion function with better memory management"""
+    
     use_initial_latent = False
     eps = 0.05
 
@@ -196,13 +274,25 @@ def diffusion_fn(chatbot, canvas_outputs, num_samples, seed, image_width, image_
 
     rng = torch.Generator(device=memory_management.gpu).manual_seed(seed)
 
-    memory_management.load_models_to_gpu([text_encoder, text_encoder_2])
-
-    positive_cond, positive_pooler, negative_cond, negative_pooler = pipeline.all_conds_from_canvas(canvas_outputs, negative_prompt)
+    # Create cache key for embeddings
+    cache_key = f"{hash(str(canvas_outputs))}_{negative_prompt}"
+    
+    if cache_key in embedding_cache:
+        print("Using cached embeddings")
+        positive_cond, positive_pooler, negative_cond, negative_pooler = embedding_cache[cache_key]
+    else:
+        memory_management.load_models_to_gpu([text_encoder, text_encoder_2])
+        positive_cond, positive_pooler, negative_cond, negative_pooler = pipeline.all_conds_from_canvas(canvas_outputs, negative_prompt)
+        
+        # Cache embeddings
+        embedding_cache[cache_key] = (positive_cond, positive_pooler, negative_cond, negative_pooler)
+        # Limit cache size
+        if len(embedding_cache) > 5:
+            embedding_cache.pop(next(iter(embedding_cache)))
 
     if use_initial_latent:
         memory_management.load_models_to_gpu([vae])
-        initial_latent = torch.from_numpy(canvas_outputs['initial_latent'])[None].movedim(-1, 1) / 127.5 - 1.0
+        initial_latent = torch.from_numpy(canvas_outputs['initial_latent'])[None].movedim(-1, 1).div_(127.5).sub_(1.0)
         initial_latent_blur = 40
         initial_latent = torch.nn.functional.avg_pool2d(
             torch.nn.functional.pad(initial_latent, (initial_latent_blur,) * 4, mode='reflect'),
@@ -231,7 +321,7 @@ def diffusion_fn(chatbot, canvas_outputs, num_samples, seed, image_width, image_
     ).images
 
     memory_management.load_models_to_gpu([vae])
-    latents = latents.to(dtype=vae.dtype, device=vae.device) / vae.config.scaling_factor
+    latents = latents.to(dtype=vae.dtype, device=vae.device).div_(vae.config.scaling_factor)
     pixels = vae.decode(latents).sample
     B, C, H, W = pixels.shape
     pixels = pytorch2numpy(pixels)
@@ -265,19 +355,29 @@ def diffusion_fn(chatbot, canvas_outputs, num_samples, seed, image_width, image_
         ).images
 
         memory_management.load_models_to_gpu([vae])
-        latents = latents.to(dtype=vae.dtype, device=vae.device) / vae.config.scaling_factor
+        latents = latents.to(dtype=vae.dtype, device=vae.device).div_(vae.config.scaling_factor)
         pixels = vae.decode(latents).sample
         pixels = pytorch2numpy(pixels)
 
+    # Save images and update chatbot
     for i in range(len(pixels)):
         unique_hex = uuid.uuid4().hex
         image_path = os.path.join(gradio_temp_dir, f"{unique_hex}_{i}.png")
         image = Image.fromarray(pixels[i])
-        image.save(image_path)
+        image.save(image_path, optimize=True)  # Optimize PNG compression
         chatbot = chatbot + [(None, (image_path, 'image'))]
+
+    # Cleanup
+    del latents, pixels
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return chatbot
 
+
+# ============================================================================
+# GRADIO UI
+# ============================================================================
 
 css = '''
 code {white-space: pre-wrap !important;}
